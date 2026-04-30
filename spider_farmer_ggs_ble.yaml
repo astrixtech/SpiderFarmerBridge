@@ -1,0 +1,654 @@
+substitutions:
+  device_name: spider-farmer-bridge
+  friendly_name: Spider Farmer Bridge
+  # GGS BLE address from nRF Connect (lowercase, colon-separated). Replace the placeholder.
+  ggs_ble_mac: "aa:bb:cc:dd:ee:ff"
+  # GATT UUIDs (override if your controller firmware differs).
+  ggs_service_uuid: "000000ff-0000-1000-8000-00805f9b34fb"
+  ggs_notify_char_uuid: "0000ff01-0000-1000-8000-00805f9b34fb"
+  ggs_write_char_uuid: "0000ff02-0000-1000-8000-00805f9b34fb"
+  # ESPHome SoC id (must match your module). Examples: esp32, esp32c3, esp32s3, esp32c2, esp32c6, ...
+  # See https://esphome.io/components/esp32.html#variants
+  # Needs Wi-Fi + BLE (e.g. not esp32s2, which has no Bluetooth).
+  esphome_variant: esp32
+  # Must match the module: 2MB, 4MB, 8MB, 16MB, or 32MB (4MB is common; many C3 devkits are 4MB).
+  flash_size: 4MB
+  # Proven API profile for this bridge; align with `api` defaults in the ESPHome docs to compare.
+  api_batch_delay: 1s
+  api_max_send_queue: "24"
+  api_listen_backlog: "6"
+  api_reboot_timeout: 30min
+  # BLE connect attempt cap (aligns with long GATT / coexistence; default in esp32_ble is 20s).
+  ble_connection_timeout: 60s
+  # Disconnected: periodic scan to find the GGS. Connected: no extra scan.
+  ggs_scan_retry_interval: 20s
+  # getDevSta refresh when GGS and HA are both connected.
+  ggs_status_interval: 30s
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  min_version: 2024.6.0
+  project:
+    name: local.spider_farmer_ggs_ble
+    version: "0.4.2"
+
+# `variant` (+ `flash_size`) is enough to build. Add `board: <id>` only if you need a devkit’s pin map.
+esp32:
+  variant: ${esphome_variant}
+  flash_size: ${flash_size}
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+ota:
+  - platform: esphome
+
+api:
+  # Shipped values below match a stable profile for Wi-Fi + BLE; see substitutions to adjust.
+  batch_delay: ${api_batch_delay}
+  max_send_queue: ${api_max_send_queue}
+  listen_backlog: ${api_listen_backlog}
+  reboot_timeout: ${api_reboot_timeout}
+  on_client_connected:
+    - logger.log:
+        format: "API client connected: %s from %s"
+        args: ["client_info.c_str()", "client_address.c_str()"]
+  on_client_disconnected:
+    - logger.log:
+        format: "API client disconnected: %s from %s"
+        args: ["client_info.c_str()", "client_address.c_str()"]
+
+esp32_ble:
+  connection_timeout: ${ble_connection_timeout}
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+  fast_connect: true
+
+esp32_ble_tracker:
+  id: ggs_ble_tracker
+  # When Wi-Fi is used, keep coexistence enabled (ESPHome default; set explicitly for clarity).
+  software_coexistence: true
+  scan_parameters:
+    # Passive, short window: light scan duty when the tracker is started (e.g. while GGS is disconnected).
+    active: false
+    continuous: false
+    interval: 800ms
+    window: 20ms
+
+ble_client:
+  - mac_address: ${ggs_ble_mac}
+    id: ggs_client
+    on_connect:
+      then:
+        - logger.log: "Connected to Spider Farmer GGS BLE device"
+        - delay: 500ms
+        - script.execute: ggs_pull_status
+    on_disconnect:
+      then:
+        - logger.log: "Disconnected from Spider Farmer GGS BLE device"
+
+script:
+  - id: ggs_pull_status
+    mode: queued
+    then:
+      - ble_client.ble_write:
+          id: ggs_client
+          service_uuid: ${ggs_service_uuid}
+          characteristic_uuid: ${ggs_write_char_uuid}
+          value: !lambda |-
+            std::string payload = "{\"method\":\"getDevSta\"}";
+            return std::vector<uint8_t>(payload.begin(), payload.end());
+
+interval:
+  # Scan retry while disconnected.
+  - interval: ${ggs_scan_retry_interval}
+    then:
+      - if:
+          condition:
+            lambda: 'return !id(ggs_client).connected();'
+          then:
+            - esp32_ble_tracker.start_scan:
+                id: ggs_ble_tracker
+                continuous: false
+  # Status pull while HA is connected (ensures initial publish and periodic refresh).
+  - interval: ${ggs_status_interval}
+    then:
+      - if:
+          condition:
+            and:
+              - lambda: 'return id(ggs_client).connected();'
+              - api.connected:
+                  state_subscription_only: true
+          then:
+            - script.execute: ggs_pull_status
+
+globals:
+  - id: rx_buffer
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: sf_published_once
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: sf_temp
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: sf_humi
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: sf_vpd
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: sf_fan_level
+    type: int
+    restore_value: no
+    initial_value: "-1"
+  - id: sf_fan_on
+    type: int
+    restore_value: no
+    initial_value: "-1"
+  - id: sf_light_level
+    type: int
+    restore_value: no
+    initial_value: "-1"
+  - id: sf_light_on
+    type: int
+    restore_value: no
+    initial_value: "-1"
+  - id: sf_light2_level
+    type: int
+    restore_value: no
+    initial_value: "-1"
+  - id: sf_blower_level
+    type: int
+    restore_value: no
+    initial_value: "-1"
+  - id: sf_blower_on
+    type: int
+    restore_value: no
+    initial_value: "-1"
+  - id: sf_humidifier_level
+    type: int
+    restore_value: no
+    initial_value: "-1"
+  - id: sf_humidifier_on
+    type: int
+    restore_value: no
+    initial_value: "-1"
+
+sensor:
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: ggs_client
+    id: ggs_stream
+    service_uuid: ${ggs_service_uuid}
+    characteristic_uuid: ${ggs_notify_char_uuid}
+    notify: true
+    update_interval: never
+    internal: true
+    lambda: |-
+      // Collect text payload from BLE fragments.
+      std::string chunk;
+      chunk.reserve(x.size());
+      for (auto b : x) {
+        if (b >= 32 && b <= 126) chunk.push_back(static_cast<char>(b));
+      }
+      if (chunk.empty()) return 0.0f;
+
+      // Capture previous values so we can publish-on-change.
+      const float prev_temp = id(sf_temp);
+      const float prev_humi = id(sf_humi);
+      const float prev_vpd = id(sf_vpd);
+      const int prev_fan_level = id(sf_fan_level);
+      const int prev_fan_on = id(sf_fan_on);
+      const int prev_light_level = id(sf_light_level);
+      const int prev_light_on = id(sf_light_on);
+      const int prev_light2_level = id(sf_light2_level);
+      const int prev_blower_level = id(sf_blower_level);
+      const int prev_blower_on = id(sf_blower_on);
+      const int prev_humidifier_level = id(sf_humidifier_level);
+      const int prev_humidifier_on = id(sf_humidifier_on);
+
+      id(rx_buffer) += chunk;
+
+      // Keep only trailing JSON-ish section.
+      auto start = id(rx_buffer).find('{');
+      if (start != std::string::npos && start > 0) {
+        id(rx_buffer).erase(0, start);
+      }
+      if (id(rx_buffer).size() > 2048) {
+        id(rx_buffer).erase(0, id(rx_buffer).size() - 2048);
+      }
+
+      // Parse only when we likely have a full object.
+      auto end = id(rx_buffer).rfind('}');
+      if (end == std::string::npos) return 0.0f;
+      std::string payload = id(rx_buffer).substr(0, end + 1);
+      id(rx_buffer).erase(0, end + 1);
+
+      auto extract_float = [&](const char *key, float &target) {
+        auto pos = payload.find(key);
+        if (pos == std::string::npos) return;
+        pos = payload.find(':', pos);
+        if (pos == std::string::npos) return;
+        pos++;
+        while (pos < payload.size() && payload[pos] == ' ') pos++;
+        char *p_end = nullptr;
+        float v = strtof(payload.c_str() + pos, &p_end);
+        if (p_end != payload.c_str() + pos) target = v;
+      };
+
+      auto extract_int = [&](const char *key, int &target) {
+        auto pos = payload.find(key);
+        if (pos == std::string::npos) return;
+        pos = payload.find(':', pos);
+        if (pos == std::string::npos) return;
+        pos++;
+        while (pos < payload.size() && payload[pos] == ' ') pos++;
+        char *p_end = nullptr;
+        long v = strtol(payload.c_str() + pos, &p_end, 10);
+        if (p_end != payload.c_str() + pos) target = static_cast<int>(v);
+      };
+
+      extract_float("\"temp\"", id(sf_temp));
+      extract_float("\"humi\"", id(sf_humi));
+      extract_float("\"vpd\"", id(sf_vpd));
+      // Try to disambiguate fan/light with scoped key matching.
+      auto fan_pos = payload.find("\"fan\"");
+      if (fan_pos != std::string::npos) {
+        auto level_pos = payload.find("\"level\"", fan_pos);
+        if (level_pos != std::string::npos) {
+          auto colon = payload.find(':', level_pos);
+          if (colon != std::string::npos) {
+            int v = atoi(payload.c_str() + colon + 1);
+            if (v >= 0 && v <= 10) id(sf_fan_level) = v;
+          }
+        }
+        auto on_pos = payload.find("\"on\"", fan_pos);
+        if (on_pos != std::string::npos) {
+          auto colon = payload.find(':', on_pos);
+          if (colon != std::string::npos) {
+            int v = atoi(payload.c_str() + colon + 1);
+            if (v == 0 || v == 1) id(sf_fan_on) = v;
+          }
+        }
+      }
+
+      auto light_pos = payload.find("\"light\"");
+      if (light_pos != std::string::npos) {
+        auto light_end = payload.find('}', light_pos);
+        if (light_end == std::string::npos) light_end = payload.size();
+        std::string light_block = payload.substr(light_pos, light_end - light_pos);
+
+        auto level_pos = light_block.find("\"level\"");
+        if (level_pos != std::string::npos) {
+          auto colon = light_block.find(':', level_pos);
+          if (colon != std::string::npos) {
+            int v = atoi(light_block.c_str() + colon + 1);
+            if (v >= 0 && v <= 100) id(sf_light_level) = v;
+          }
+        }
+        auto on_pos = light_block.find("\"on\"");
+        if (on_pos != std::string::npos) {
+          auto colon = light_block.find(':', on_pos);
+          if (colon != std::string::npos) {
+            int v = atoi(light_block.c_str() + colon + 1);
+            if (v == 0 || v == 1) id(sf_light_on) = v;
+          }
+        }
+        // Firmware variant fallback keys.
+        auto brightness_pos = light_block.find("\"brightness\"");
+        if (brightness_pos != std::string::npos) {
+          auto colon = light_block.find(':', brightness_pos);
+          if (colon != std::string::npos) {
+            int v = atoi(light_block.c_str() + colon + 1);
+            if (v >= 0 && v <= 100) id(sf_light_level) = v;
+          }
+        }
+        auto dim_pos = light_block.find("\"dim\"");
+        if (dim_pos != std::string::npos) {
+          auto colon = light_block.find(':', dim_pos);
+          if (colon != std::string::npos) {
+            int v = atoi(light_block.c_str() + colon + 1);
+            if (v >= 0 && v <= 100) id(sf_light_level) = v;
+          }
+        }
+        // Some firmware builds report "l.evel" instead of "level".
+        auto ldot_pos = light_block.find("\"l.evel\"");
+        if (ldot_pos != std::string::npos) {
+          auto colon = light_block.find(':', ldot_pos);
+          if (colon != std::string::npos) {
+            int v = atoi(light_block.c_str() + colon + 1);
+            if (v >= 0 && v <= 100) id(sf_light_level) = v;
+          }
+        }
+      }
+      // Firmware variant fallback: first light block may be an unlabeled object before "light2".
+      if (light_pos == std::string::npos) {
+        auto light2_marker = payload.find("\"light2\"");
+        if (light2_marker != std::string::npos) {
+          auto first_obj_start = payload.find('{');
+          if (first_obj_start != std::string::npos && first_obj_start < light2_marker) {
+            std::string light_block = payload.substr(first_obj_start, light2_marker - first_obj_start);
+            bool light_on_set = false;
+            bool light_level_set = false;
+
+            auto on_pos = light_block.find("\"on\"");
+            if (on_pos != std::string::npos) {
+              auto colon = light_block.find(':', on_pos);
+              if (colon != std::string::npos) {
+                int v = atoi(light_block.c_str() + colon + 1);
+                if (v == 0 || v == 1) {
+                  id(sf_light_on) = v;
+                  light_on_set = true;
+                }
+              }
+            }
+
+            auto level_pos = light_block.find("\"level\"");
+            if (level_pos != std::string::npos) {
+              auto colon = light_block.find(':', level_pos);
+              if (colon != std::string::npos) {
+                int v = atoi(light_block.c_str() + colon + 1);
+                if (v >= 0 && v <= 100) {
+                  id(sf_light_level) = v;
+                  light_level_set = true;
+                }
+              }
+            }
+            auto ldot_pos = light_block.find("\"l.evel\"");
+            if (ldot_pos != std::string::npos) {
+              auto colon = light_block.find(':', ldot_pos);
+              if (colon != std::string::npos) {
+                int v = atoi(light_block.c_str() + colon + 1);
+                if (v >= 0 && v <= 100) {
+                  id(sf_light_level) = v;
+                  light_level_set = true;
+                }
+              }
+            }
+            auto bracket_level_pos = light_block.find("\"[level\"");
+            if (bracket_level_pos != std::string::npos) {
+              auto colon = light_block.find(':', bracket_level_pos);
+              if (colon != std::string::npos) {
+                int v = atoi(light_block.c_str() + colon + 1);
+                if (v >= 0 && v <= 100) {
+                  id(sf_light_level) = v;
+                  light_level_set = true;
+                }
+              }
+            }
+
+            // Last-resort parser for firmware variants with corrupted key names
+            // (example observed: "l=+5evel"). Expected field order is modeType, on, level.
+            // IMPORTANT: only parse numbers that are values after ':' to avoid
+            // accidentally reading digits embedded in broken key names.
+            if (!light_level_set || !light_on_set) {
+              int values[8];
+              int v_count = 0;
+              for (size_t i = 0; i < light_block.size() && v_count < 8; i++) {
+                if (light_block[i] == ':') {
+                  i++;
+                  while (i < light_block.size() && light_block[i] == ' ') i++;
+                  char *end_ptr = nullptr;
+                  long parsed = strtol(light_block.c_str() + i, &end_ptr, 10);
+                  if (end_ptr != light_block.c_str() + i) {
+                    values[v_count++] = (int) parsed;
+                    i = (size_t) (end_ptr - light_block.c_str()) - 1;
+                  }
+                }
+              }
+              // modeType, on, level are usually first 3 values in this block.
+              if (!light_on_set && v_count >= 2) {
+                int v = values[1];
+                if (v == 0 || v == 1) id(sf_light_on) = v;
+              }
+              if (!light_level_set && v_count >= 3) {
+                int v = values[2];
+                if (v >= 0 && v <= 100) id(sf_light_level) = v;
+              } else if (!light_level_set && v_count >= 4) {
+                // Sometimes an extra field appears before level; try next value.
+                int v = values[3];
+                if (v >= 0 && v <= 100) id(sf_light_level) = v;
+              }
+            }
+          }
+        }
+      }
+
+      auto light2_pos = payload.find("\"light2\"");
+      if (light2_pos != std::string::npos) {
+        auto light2_end = payload.find('}', light2_pos);
+        if (light2_end == std::string::npos) light2_end = payload.size();
+        std::string light2_block = payload.substr(light2_pos, light2_end - light2_pos);
+        auto level_pos = light2_block.find("\"level\"");
+        if (level_pos != std::string::npos) {
+          auto colon = light2_block.find(':', level_pos);
+          if (colon != std::string::npos) {
+            int v = atoi(light2_block.c_str() + colon + 1);
+            if (v >= 0 && v <= 100) id(sf_light2_level) = v;
+          }
+        }
+      }
+
+      auto blower_pos = payload.find("\"blower\"");
+      if (blower_pos != std::string::npos) {
+        auto blower_end = payload.find('}', blower_pos);
+        if (blower_end == std::string::npos) blower_end = payload.size();
+        std::string blower_block = payload.substr(blower_pos, blower_end - blower_pos);
+        auto level_pos = blower_block.find("\"level\"");
+        if (level_pos != std::string::npos) {
+          auto colon = blower_block.find(':', level_pos);
+          if (colon != std::string::npos) {
+            id(sf_blower_level) = atoi(blower_block.c_str() + colon + 1);
+            id(sf_blower_on) = id(sf_blower_level) > 0 ? 1 : 0;
+          }
+        }
+        auto on_pos = blower_block.find("\"on\"");
+        if (on_pos != std::string::npos) {
+          auto colon = blower_block.find(':', on_pos);
+          if (colon != std::string::npos) id(sf_blower_on) = atoi(blower_block.c_str() + colon + 1);
+        }
+      }
+
+      auto humidifier_pos = payload.find("\"humidifier\"");
+      if (humidifier_pos != std::string::npos) {
+        auto humidifier_end = payload.find('}', humidifier_pos);
+        if (humidifier_end == std::string::npos) humidifier_end = payload.size();
+        std::string humidifier_block = payload.substr(humidifier_pos, humidifier_end - humidifier_pos);
+        auto level_pos = humidifier_block.find("\"level\"");
+        if (level_pos != std::string::npos) {
+          auto colon = humidifier_block.find(':', level_pos);
+          if (colon != std::string::npos) {
+            id(sf_humidifier_level) = atoi(humidifier_block.c_str() + colon + 1);
+            id(sf_humidifier_on) = id(sf_humidifier_level) > 0 ? 1 : 0;
+          }
+        }
+        auto on_pos = humidifier_block.find("\"on\"");
+        if (on_pos != std::string::npos) {
+          auto colon = humidifier_block.find(':', on_pos);
+          if (colon != std::string::npos) id(sf_humidifier_on) = atoi(humidifier_block.c_str() + colon + 1);
+        }
+      }
+
+      // Publish-on-change (plus one forced initial publish).
+      const bool force = !id(sf_published_once);
+
+      auto publish_float = [&](float prev, float cur, sensor::Sensor *s) {
+        if (force || cur != prev) s->publish_state(cur);
+      };
+      auto publish_text_int = [&](int prev, int cur, text_sensor::TextSensor *s, bool add_percent) {
+        if (cur < 0) return;
+        if (!force && cur == prev) return;
+        if (add_percent) s->publish_state(to_string(cur) + "%");
+        else s->publish_state(to_string(cur));
+      };
+      auto publish_bin = [&](int prev, int cur, binary_sensor::BinarySensor *s) {
+        if (cur < 0) return;
+        if (!force && cur == prev) return;
+        s->publish_state(cur == 1);
+      };
+
+      publish_float(prev_temp, id(sf_temp), id(sf_temp_sensor));
+      publish_float(prev_humi, id(sf_humi), id(sf_humi_sensor));
+      publish_float(prev_vpd, id(sf_vpd), id(sf_vpd_sensor));
+
+      publish_text_int(prev_fan_level, id(sf_fan_level), id(sf_fan_level_text), false);
+      publish_text_int(prev_light_level, id(sf_light_level), id(sf_light_level_text), true);
+      publish_text_int(prev_light2_level, id(sf_light2_level), id(sf_light2_level_text), true);
+      publish_text_int(prev_blower_level, id(sf_blower_level), id(sf_blower_level_text), false);
+      publish_text_int(prev_humidifier_level, id(sf_humidifier_level), id(sf_humidifier_level_text), false);
+
+      publish_bin(prev_fan_on, id(sf_fan_on), id(sf_fan_bin));
+      publish_bin(prev_light_on, id(sf_light_on), id(sf_light_bin));
+      publish_bin(prev_blower_on, id(sf_blower_on), id(sf_blower_bin));
+      publish_bin(prev_humidifier_on, id(sf_humidifier_on), id(sf_humidifier_bin));
+
+      id(sf_published_once) = true;
+      return 0.0f;
+
+  - platform: template
+    name: "Temperature"
+    id: sf_temp_sensor
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: "°C"
+    update_interval: never
+    lambda: |-
+      return id(sf_temp);
+
+  - platform: template
+    name: "Humidity"
+    id: sf_humi_sensor
+    device_class: humidity
+    state_class: measurement
+    unit_of_measurement: "%"
+    update_interval: never
+    lambda: |-
+      return id(sf_humi);
+
+  - platform: template
+    name: "VPD"
+    id: sf_vpd_sensor
+    state_class: measurement
+    unit_of_measurement: "kPa"
+    accuracy_decimals: 2
+    update_interval: never
+    lambda: |-
+      return id(sf_vpd);
+
+binary_sensor:
+  - platform: template
+    name: "Fan"
+    id: sf_fan_bin
+    device_class: running
+    icon: mdi:fan
+    lambda: |-
+      if (id(sf_fan_on) < 0) {
+        return {};
+      }
+      return id(sf_fan_on) == 1;
+
+  - platform: template
+    name: "Light"
+    id: sf_light_bin
+    icon: mdi:lightbulb
+    lambda: |-
+      if (id(sf_light_on) < 0) {
+        return {};
+      }
+      return id(sf_light_on) == 1;
+
+  - platform: template
+    name: "Blower"
+    id: sf_blower_bin
+    device_class: running
+    icon: mdi:weather-windy
+    lambda: |-
+      if (id(sf_blower_on) < 0) {
+        return {};
+      }
+      return id(sf_blower_on) == 1;
+
+  - platform: template
+    name: "Humidifier"
+    id: sf_humidifier_bin
+    icon: mdi:air-humidifier
+    lambda: |-
+      if (id(sf_humidifier_on) < 0) {
+        return {};
+      }
+      return id(sf_humidifier_on) == 1;
+
+text_sensor:
+  - platform: template
+    name: "Fan Level"
+    id: sf_fan_level_text
+    icon: mdi:fan-speed-1
+    update_interval: never
+    lambda: |-
+      if (id(sf_fan_level) < 0) {
+        return {};
+      }
+      return to_string(id(sf_fan_level));
+
+  - platform: template
+    name: "Light Level"
+    id: sf_light_level_text
+    icon: mdi:brightness-percent
+    update_interval: never
+    lambda: |-
+      if (id(sf_light_level) < 0) {
+        return {};
+      }
+      return to_string(id(sf_light_level)) + "%";
+
+  - platform: template
+    name: "Light 2 Level"
+    id: sf_light2_level_text
+    icon: mdi:brightness-percent
+    update_interval: never
+    lambda: |-
+      if (id(sf_light2_level) < 0) {
+        return {};
+      }
+      return to_string(id(sf_light2_level)) + "%";
+
+  - platform: template
+    name: "Blower Level"
+    id: sf_blower_level_text
+    icon: mdi:fan-chevron-up
+    update_interval: never
+    lambda: |-
+      if (id(sf_blower_level) < 0) {
+        return {};
+      }
+      return to_string(id(sf_blower_level));
+
+  - platform: template
+    name: "Humidifier Level"
+    id: sf_humidifier_level_text
+    icon: mdi:water-percent
+    update_interval: never
+    lambda: |-
+      if (id(sf_humidifier_level) < 0) {
+        return {};
+      }
+      return to_string(id(sf_humidifier_level));
+
+# Optional MQTT export.
+# Uncomment and set secrets if you still want MQTT beside Home Assistant native API.
+# mqtt:
+#   broker: !secret mqtt_broker
+#   username: !secret mqtt_username
+#   password: !secret mqtt_password

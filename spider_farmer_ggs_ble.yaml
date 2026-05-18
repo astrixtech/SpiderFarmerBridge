@@ -31,7 +31,7 @@ esphome:
   min_version: 2024.6.0
   project:
     name: local.spider_farmer_ggs_ble
-    version: "0.4.2"
+    version: "0.4.6"
 
 # `variant` (+ `flash_size`) is enough to build. Add `board: <id>` only if you need a devkit’s pin map.
 esp32:
@@ -222,73 +222,183 @@ sensor:
       id(rx_buffer) += chunk;
 
       // Keep only trailing JSON-ish section.
-      auto start = id(rx_buffer).find('{');
-      if (start != std::string::npos && start > 0) {
-        id(rx_buffer).erase(0, start);
+      auto json_start = id(rx_buffer).find('{');
+      if (json_start != std::string::npos && json_start > 0) {
+        id(rx_buffer).erase(0, json_start);
       }
       if (id(rx_buffer).size() > 2048) {
         id(rx_buffer).erase(0, id(rx_buffer).size() - 2048);
       }
 
-      // Parse only when we likely have a full object.
+      // Extract a full {...} object after a JSON key (do not use the first '}' in the string).
+      auto json_object_after_key = [&](const std::string &hay, const char *key) -> std::string {
+        auto k = hay.find(key);
+        if (k == std::string::npos) return "";
+        auto colon = hay.find(':', k);
+        if (colon == std::string::npos) return "";
+        auto ob = hay.find('{', colon);
+        if (ob == std::string::npos) return "";
+        int depth = 0;
+        for (size_t i = ob; i < hay.size(); i++) {
+          if (hay[i] == '{') depth++;
+          else if (hay[i] == '}') {
+            depth--;
+            if (depth == 0) return hay.substr(ob, i - ob + 1);
+          }
+        }
+        return "";
+      };
+
+      auto slice_after_key = [&](const std::string &hay, const char *key) -> std::string {
+        auto k = hay.find(key);
+        if (k == std::string::npos) return "";
+        size_t slice_end = hay.size();
+        const char *stops[] = {"\"fan\"", "\"humidifier\"", "\"light2\"", "\"light\"", "\"sensor\"", "\"temp\""};
+        for (auto stop : stops) {
+          auto p = hay.find(stop, k + 8);
+          if (p != std::string::npos && p < slice_end) slice_end = p;
+        }
+        return hay.substr(k, slice_end - k);
+      };
+
+      // Scoped field lookup (cr0ssn0tice MQTT bridge): parent key then child within ~220 chars.
+      auto extract_scoped_int = [&](const std::string &hay, const char *parent_key, const char *field_key) -> int {
+        std::string parent = std::string("\"") + parent_key + "\":";
+        auto parent_pos = hay.find(parent);
+        if (parent_pos == std::string::npos) return -1;
+        size_t limit = parent_pos + 220;
+        if (limit > hay.size()) limit = hay.size();
+        std::string slice = hay.substr(parent_pos, limit - parent_pos);
+        std::string field = std::string("\"") + field_key + "\":";
+        auto field_pos = slice.find(field);
+        if (field_pos == std::string::npos) return -1;
+        auto colon = slice.find(':', field_pos);
+        if (colon == std::string::npos) return -1;
+        return atoi(slice.c_str() + colon + 1);
+      };
+
+      // Blower: second BLE fragment often starts with "wblower" (packet split ate "bo").
+      // Match substring "blower" only — never require a leading quote on the key.
+      auto apply_blower_from = [&](const std::string &hay) {
+        auto blower_pos = hay.find("blower");
+        if (blower_pos == std::string::npos) return;
+
+        size_t slice_end = hay.size();
+        auto fan_after = hay.find("\"fan\"", blower_pos);
+        if (fan_after != std::string::npos && fan_after < slice_end) slice_end = fan_after;
+        if (slice_end - blower_pos > 200) slice_end = blower_pos + 200;
+        std::string slice = hay.substr(blower_pos, slice_end - blower_pos);
+
+        auto field_int = [&](const char *field) -> int {
+          std::string key = std::string("\"") + field + "\":";
+          auto fp = slice.find(key);
+          if (fp == std::string::npos) return -1;
+          auto colon = slice.find(':', fp);
+          if (colon == std::string::npos) return -1;
+          return atoi(slice.c_str() + colon + 1);
+        };
+
+        int b_level = field_int("level");
+        int b_mode = field_int("modeType");
+        int b_on = field_int("on");
+
+        int pct = -1;
+        if (b_on == 0) {
+          pct = 0;
+        } else if (b_level >= 0 && b_level <= 100) {
+          pct = b_level;
+        } else if (b_mode >= 50 && b_mode <= 100) {
+          pct = b_mode;
+        } else if (b_level >= 0 && b_level <= 100) {
+          pct = b_level;
+        }
+        if (pct < 0) return;
+
+        id(sf_blower_level) = pct;
+        if (b_on == 0 || b_on == 1) {
+          id(sf_blower_on) = b_on;
+        } else {
+          id(sf_blower_on) = pct > 0 ? 1 : 0;
+        }
+      };
+
+      // Opportunistic blower parse on every fragment (blower often arrives without a full frame).
+      apply_blower_from(id(rx_buffer));
+
+      const bool force = !id(sf_published_once);
+      auto publish_float = [&](float prev, float cur, sensor::Sensor *s) {
+        if (force || cur != prev) s->publish_state(cur);
+      };
+      auto publish_text_int = [&](int prev, int cur, text_sensor::TextSensor *s, bool add_percent) {
+        if (cur < 0) return;
+        if (!force && cur == prev) return;
+        if (add_percent) s->publish_state(to_string(cur) + "%");
+        else s->publish_state(to_string(cur));
+      };
+      auto publish_bin = [&](int prev, int cur, binary_sensor::BinarySensor *s) {
+        if (cur < 0) return;
+        if (!force && cur == prev) return;
+        s->publish_state(cur == 1);
+      };
+
+      // Full-frame parse (reference bridge: fan present + closing braces).
+      const bool has_fan = id(rx_buffer).find("\"fan\"") != std::string::npos;
+      const bool has_frame_end = id(rx_buffer).find("}}") != std::string::npos;
+      if (!has_fan || !has_frame_end) {
+        publish_text_int(prev_blower_level, id(sf_blower_level), id(sf_blower_level_text), true);
+        publish_bin(prev_blower_on, id(sf_blower_on), id(sf_blower_bin));
+        if (id(sf_blower_level) >= 0 || id(sf_blower_on) >= 0) id(sf_published_once) = true;
+        return 0.0f;
+      }
+
+      auto start = id(rx_buffer).find('{');
+      if (start == std::string::npos) return 0.0f;
       auto end = id(rx_buffer).rfind('}');
-      if (end == std::string::npos) return 0.0f;
-      std::string payload = id(rx_buffer).substr(0, end + 1);
-      id(rx_buffer).erase(0, end + 1);
+      if (end == std::string::npos || end < start) return 0.0f;
+      std::string devices_hay = id(rx_buffer).substr(start, end - start + 1);
+      id(rx_buffer).clear();
 
-      auto extract_float = [&](const char *key, float &target) {
-        auto pos = payload.find(key);
+      apply_blower_from(devices_hay);
+
+      auto extract_float = [&](const std::string &hay, const char *key, float &target) {
+        auto pos = hay.find(key);
         if (pos == std::string::npos) return;
-        pos = payload.find(':', pos);
+        pos = hay.find(':', pos);
         if (pos == std::string::npos) return;
         pos++;
-        while (pos < payload.size() && payload[pos] == ' ') pos++;
+        while (pos < hay.size() && hay[pos] == ' ') pos++;
         char *p_end = nullptr;
-        float v = strtof(payload.c_str() + pos, &p_end);
-        if (p_end != payload.c_str() + pos) target = v;
+        float v = strtof(hay.c_str() + pos, &p_end);
+        if (p_end != hay.c_str() + pos) target = v;
       };
 
-      auto extract_int = [&](const char *key, int &target) {
-        auto pos = payload.find(key);
-        if (pos == std::string::npos) return;
-        pos = payload.find(':', pos);
-        if (pos == std::string::npos) return;
-        pos++;
-        while (pos < payload.size() && payload[pos] == ' ') pos++;
-        char *p_end = nullptr;
-        long v = strtol(payload.c_str() + pos, &p_end, 10);
-        if (p_end != payload.c_str() + pos) target = static_cast<int>(v);
-      };
-
-      extract_float("\"temp\"", id(sf_temp));
-      extract_float("\"humi\"", id(sf_humi));
-      extract_float("\"vpd\"", id(sf_vpd));
-      // Try to disambiguate fan/light with scoped key matching.
-      auto fan_pos = payload.find("\"fan\"");
-      if (fan_pos != std::string::npos) {
-        auto level_pos = payload.find("\"level\"", fan_pos);
+      extract_float(devices_hay, "\"temp\"", id(sf_temp));
+      extract_float(devices_hay, "\"humi\"", id(sf_humi));
+      extract_float(devices_hay, "\"vpd\"", id(sf_vpd));
+      std::string fan_block = json_object_after_key(devices_hay, "\"fan\"");
+      if (!fan_block.empty()) {
+        auto level_pos = fan_block.find("\"level\"");
         if (level_pos != std::string::npos) {
-          auto colon = payload.find(':', level_pos);
+          auto colon = fan_block.find(':', level_pos);
           if (colon != std::string::npos) {
-            int v = atoi(payload.c_str() + colon + 1);
+            int v = atoi(fan_block.c_str() + colon + 1);
             if (v >= 0 && v <= 10) id(sf_fan_level) = v;
           }
         }
-        auto on_pos = payload.find("\"on\"", fan_pos);
+        auto on_pos = fan_block.find("\"on\"");
         if (on_pos != std::string::npos) {
-          auto colon = payload.find(':', on_pos);
+          auto colon = fan_block.find(':', on_pos);
           if (colon != std::string::npos) {
-            int v = atoi(payload.c_str() + colon + 1);
+            int v = atoi(fan_block.c_str() + colon + 1);
             if (v == 0 || v == 1) id(sf_fan_on) = v;
           }
         }
       }
 
-      auto light_pos = payload.find("\"light\"");
+      auto light_pos = devices_hay.find("\"light\"");
       if (light_pos != std::string::npos) {
-        auto light_end = payload.find('}', light_pos);
-        if (light_end == std::string::npos) light_end = payload.size();
-        std::string light_block = payload.substr(light_pos, light_end - light_pos);
+        std::string light_block = json_object_after_key(devices_hay, "\"light\"");
+        if (light_block.empty()) light_block = devices_hay.substr(light_pos);
 
         auto level_pos = light_block.find("\"level\"");
         if (level_pos != std::string::npos) {
@@ -335,11 +445,11 @@ sensor:
       }
       // Firmware variant fallback: first light block may be an unlabeled object before "light2".
       if (light_pos == std::string::npos) {
-        auto light2_marker = payload.find("\"light2\"");
+        auto light2_marker = devices_hay.find("\"light2\"");
         if (light2_marker != std::string::npos) {
-          auto first_obj_start = payload.find('{');
+          auto first_obj_start = devices_hay.find('{');
           if (first_obj_start != std::string::npos && first_obj_start < light2_marker) {
-            std::string light_block = payload.substr(first_obj_start, light2_marker - first_obj_start);
+            std::string light_block = devices_hay.substr(first_obj_start, light2_marker - first_obj_start);
             bool light_on_set = false;
             bool light_level_set = false;
 
@@ -426,11 +536,10 @@ sensor:
         }
       }
 
-      auto light2_pos = payload.find("\"light2\"");
+      auto light2_pos = devices_hay.find("\"light2\"");
       if (light2_pos != std::string::npos) {
-        auto light2_end = payload.find('}', light2_pos);
-        if (light2_end == std::string::npos) light2_end = payload.size();
-        std::string light2_block = payload.substr(light2_pos, light2_end - light2_pos);
+        std::string light2_block = json_object_after_key(devices_hay, "\"light2\"");
+        if (light2_block.empty()) light2_block = devices_hay.substr(light2_pos);
         auto level_pos = light2_block.find("\"level\"");
         if (level_pos != std::string::npos) {
           auto colon = light2_block.find(':', level_pos);
@@ -441,31 +550,10 @@ sensor:
         }
       }
 
-      auto blower_pos = payload.find("\"blower\"");
-      if (blower_pos != std::string::npos) {
-        auto blower_end = payload.find('}', blower_pos);
-        if (blower_end == std::string::npos) blower_end = payload.size();
-        std::string blower_block = payload.substr(blower_pos, blower_end - blower_pos);
-        auto level_pos = blower_block.find("\"level\"");
-        if (level_pos != std::string::npos) {
-          auto colon = blower_block.find(':', level_pos);
-          if (colon != std::string::npos) {
-            id(sf_blower_level) = atoi(blower_block.c_str() + colon + 1);
-            id(sf_blower_on) = id(sf_blower_level) > 0 ? 1 : 0;
-          }
-        }
-        auto on_pos = blower_block.find("\"on\"");
-        if (on_pos != std::string::npos) {
-          auto colon = blower_block.find(':', on_pos);
-          if (colon != std::string::npos) id(sf_blower_on) = atoi(blower_block.c_str() + colon + 1);
-        }
-      }
-
-      auto humidifier_pos = payload.find("\"humidifier\"");
+      auto humidifier_pos = devices_hay.find("\"humidifier\"");
       if (humidifier_pos != std::string::npos) {
-        auto humidifier_end = payload.find('}', humidifier_pos);
-        if (humidifier_end == std::string::npos) humidifier_end = payload.size();
-        std::string humidifier_block = payload.substr(humidifier_pos, humidifier_end - humidifier_pos);
+        std::string humidifier_block = json_object_after_key(devices_hay, "\"humidifier\"");
+        if (humidifier_block.empty()) humidifier_block = devices_hay.substr(humidifier_pos);
         auto level_pos = humidifier_block.find("\"level\"");
         if (level_pos != std::string::npos) {
           auto colon = humidifier_block.find(':', level_pos);
@@ -481,23 +569,8 @@ sensor:
         }
       }
 
-      // Publish-on-change (plus one forced initial publish).
-      const bool force = !id(sf_published_once);
-
-      auto publish_float = [&](float prev, float cur, sensor::Sensor *s) {
-        if (force || cur != prev) s->publish_state(cur);
-      };
-      auto publish_text_int = [&](int prev, int cur, text_sensor::TextSensor *s, bool add_percent) {
-        if (cur < 0) return;
-        if (!force && cur == prev) return;
-        if (add_percent) s->publish_state(to_string(cur) + "%");
-        else s->publish_state(to_string(cur));
-      };
-      auto publish_bin = [&](int prev, int cur, binary_sensor::BinarySensor *s) {
-        if (cur < 0) return;
-        if (!force && cur == prev) return;
-        s->publish_state(cur == 1);
-      };
+      // Dark cycle: when light is off, do not surface stray non-zero level from corrupt keys.
+      if (id(sf_light_on) == 0) id(sf_light_level) = 0;
 
       publish_float(prev_temp, id(sf_temp), id(sf_temp_sensor));
       publish_float(prev_humi, id(sf_humi), id(sf_humi_sensor));
@@ -506,7 +579,7 @@ sensor:
       publish_text_int(prev_fan_level, id(sf_fan_level), id(sf_fan_level_text), false);
       publish_text_int(prev_light_level, id(sf_light_level), id(sf_light_level_text), true);
       publish_text_int(prev_light2_level, id(sf_light2_level), id(sf_light2_level_text), true);
-      publish_text_int(prev_blower_level, id(sf_blower_level), id(sf_blower_level_text), false);
+      publish_text_int(prev_blower_level, id(sf_blower_level), id(sf_blower_level_text), true);
       publish_text_int(prev_humidifier_level, id(sf_humidifier_level), id(sf_humidifier_level_text), false);
 
       publish_bin(prev_fan_on, id(sf_fan_on), id(sf_fan_bin));
@@ -633,7 +706,7 @@ text_sensor:
       if (id(sf_blower_level) < 0) {
         return {};
       }
-      return to_string(id(sf_blower_level));
+      return to_string(id(sf_blower_level)) + "%";
 
   - platform: template
     name: "Humidifier Level"

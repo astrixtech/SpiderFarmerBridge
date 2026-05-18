@@ -322,6 +322,43 @@ sensor:
         }
       };
 
+      // Primary light block is in BLE packet 1 (before light2). "on" is often 1 while level is 0
+      // during dark cycle — level is the real output state.
+      auto apply_light_from = [&](const std::string &hay) {
+        size_t key = hay.find("\"light\":");
+        if (key == std::string::npos) {
+          key = hay.find("light\":");
+          if (key == std::string::npos) return;
+        }
+        size_t slice_end = hay.size();
+        auto l2 = hay.find("\"light2\"", key + 6);
+        if (l2 != std::string::npos && l2 < slice_end) slice_end = l2;
+        if (slice_end - key > 160) slice_end = key + 160;
+        std::string slice = hay.substr(key, slice_end - key);
+
+        auto field_int = [&](const char *field) -> int {
+          std::string fk = std::string("\"") + field + "\":";
+          auto fp = slice.find(fk);
+          if (fp == std::string::npos) return -1;
+          auto colon = slice.find(':', fp);
+          if (colon == std::string::npos) return -1;
+          return atoi(slice.c_str() + colon + 1);
+        };
+
+        int lvl = field_int("level");
+        auto ldot = slice.find("\"l.evel\"");
+        if (ldot != std::string::npos) {
+          auto colon = slice.find(':', ldot);
+          if (colon != std::string::npos) {
+            int v = atoi(slice.c_str() + colon + 1);
+            if (v >= 0 && v <= 100) lvl = v;
+          }
+        }
+        if (lvl < 0 || lvl > 100) return;
+        id(sf_light_level) = lvl;
+        id(sf_light_on) = lvl > 0 ? 1 : 0;
+      };
+
       // Opportunistic blower parse on every fragment (blower often arrives without a full frame).
       apply_blower_from(id(rx_buffer));
 
@@ -395,145 +432,9 @@ sensor:
         }
       }
 
-      auto light_pos = devices_hay.find("\"light\"");
-      if (light_pos != std::string::npos) {
-        std::string light_block = json_object_after_key(devices_hay, "\"light\"");
-        if (light_block.empty()) light_block = devices_hay.substr(light_pos);
-
-        auto level_pos = light_block.find("\"level\"");
-        if (level_pos != std::string::npos) {
-          auto colon = light_block.find(':', level_pos);
-          if (colon != std::string::npos) {
-            int v = atoi(light_block.c_str() + colon + 1);
-            if (v >= 0 && v <= 100) id(sf_light_level) = v;
-          }
-        }
-        auto on_pos = light_block.find("\"on\"");
-        if (on_pos != std::string::npos) {
-          auto colon = light_block.find(':', on_pos);
-          if (colon != std::string::npos) {
-            int v = atoi(light_block.c_str() + colon + 1);
-            if (v == 0 || v == 1) id(sf_light_on) = v;
-          }
-        }
-        // Firmware variant fallback keys.
-        auto brightness_pos = light_block.find("\"brightness\"");
-        if (brightness_pos != std::string::npos) {
-          auto colon = light_block.find(':', brightness_pos);
-          if (colon != std::string::npos) {
-            int v = atoi(light_block.c_str() + colon + 1);
-            if (v >= 0 && v <= 100) id(sf_light_level) = v;
-          }
-        }
-        auto dim_pos = light_block.find("\"dim\"");
-        if (dim_pos != std::string::npos) {
-          auto colon = light_block.find(':', dim_pos);
-          if (colon != std::string::npos) {
-            int v = atoi(light_block.c_str() + colon + 1);
-            if (v >= 0 && v <= 100) id(sf_light_level) = v;
-          }
-        }
-        // Some firmware builds report "l.evel" instead of "level".
-        auto ldot_pos = light_block.find("\"l.evel\"");
-        if (ldot_pos != std::string::npos) {
-          auto colon = light_block.find(':', ldot_pos);
-          if (colon != std::string::npos) {
-            int v = atoi(light_block.c_str() + colon + 1);
-            if (v >= 0 && v <= 100) id(sf_light_level) = v;
-          }
-        }
-      }
-      // Firmware variant fallback: first light block may be an unlabeled object before "light2".
-      if (light_pos == std::string::npos) {
-        auto light2_marker = devices_hay.find("\"light2\"");
-        if (light2_marker != std::string::npos) {
-          auto first_obj_start = devices_hay.find('{');
-          if (first_obj_start != std::string::npos && first_obj_start < light2_marker) {
-            std::string light_block = devices_hay.substr(first_obj_start, light2_marker - first_obj_start);
-            bool light_on_set = false;
-            bool light_level_set = false;
-
-            auto on_pos = light_block.find("\"on\"");
-            if (on_pos != std::string::npos) {
-              auto colon = light_block.find(':', on_pos);
-              if (colon != std::string::npos) {
-                int v = atoi(light_block.c_str() + colon + 1);
-                if (v == 0 || v == 1) {
-                  id(sf_light_on) = v;
-                  light_on_set = true;
-                }
-              }
-            }
-
-            auto level_pos = light_block.find("\"level\"");
-            if (level_pos != std::string::npos) {
-              auto colon = light_block.find(':', level_pos);
-              if (colon != std::string::npos) {
-                int v = atoi(light_block.c_str() + colon + 1);
-                if (v >= 0 && v <= 100) {
-                  id(sf_light_level) = v;
-                  light_level_set = true;
-                }
-              }
-            }
-            auto ldot_pos = light_block.find("\"l.evel\"");
-            if (ldot_pos != std::string::npos) {
-              auto colon = light_block.find(':', ldot_pos);
-              if (colon != std::string::npos) {
-                int v = atoi(light_block.c_str() + colon + 1);
-                if (v >= 0 && v <= 100) {
-                  id(sf_light_level) = v;
-                  light_level_set = true;
-                }
-              }
-            }
-            auto bracket_level_pos = light_block.find("\"[level\"");
-            if (bracket_level_pos != std::string::npos) {
-              auto colon = light_block.find(':', bracket_level_pos);
-              if (colon != std::string::npos) {
-                int v = atoi(light_block.c_str() + colon + 1);
-                if (v >= 0 && v <= 100) {
-                  id(sf_light_level) = v;
-                  light_level_set = true;
-                }
-              }
-            }
-
-            // Last-resort parser for firmware variants with corrupted key names
-            // (example observed: "l=+5evel"). Expected field order is modeType, on, level.
-            // IMPORTANT: only parse numbers that are values after ':' to avoid
-            // accidentally reading digits embedded in broken key names.
-            if (!light_level_set || !light_on_set) {
-              int values[8];
-              int v_count = 0;
-              for (size_t i = 0; i < light_block.size() && v_count < 8; i++) {
-                if (light_block[i] == ':') {
-                  i++;
-                  while (i < light_block.size() && light_block[i] == ' ') i++;
-                  char *end_ptr = nullptr;
-                  long parsed = strtol(light_block.c_str() + i, &end_ptr, 10);
-                  if (end_ptr != light_block.c_str() + i) {
-                    values[v_count++] = (int) parsed;
-                    i = (size_t) (end_ptr - light_block.c_str()) - 1;
-                  }
-                }
-              }
-              // modeType, on, level are usually first 3 values in this block.
-              if (!light_on_set && v_count >= 2) {
-                int v = values[1];
-                if (v == 0 || v == 1) id(sf_light_on) = v;
-              }
-              if (!light_level_set && v_count >= 3) {
-                int v = values[2];
-                if (v >= 0 && v <= 100) id(sf_light_level) = v;
-              } else if (!light_level_set && v_count >= 4) {
-                // Sometimes an extra field appears before level; try next value.
-                int v = values[3];
-                if (v >= 0 && v <= 100) id(sf_light_level) = v;
-              }
-            }
-          }
-        }
+      // Require light2 marker — proves packet-1 device block is complete (avoids 0/85 flicker).
+      if (devices_hay.find("\"light2\"") != std::string::npos) {
+        apply_light_from(devices_hay);
       }
 
       auto light2_pos = devices_hay.find("\"light2\"");
@@ -568,9 +469,6 @@ sensor:
           if (colon != std::string::npos) id(sf_humidifier_on) = atoi(humidifier_block.c_str() + colon + 1);
         }
       }
-
-      // Dark cycle: when light is off, do not surface stray non-zero level from corrupt keys.
-      if (id(sf_light_on) == 0) id(sf_light_level) = 0;
 
       publish_float(prev_temp, id(sf_temp), id(sf_temp_sensor));
       publish_float(prev_humi, id(sf_humi), id(sf_humi_sensor));

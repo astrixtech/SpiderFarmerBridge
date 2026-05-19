@@ -116,6 +116,37 @@ interval:
             - esp32_ble_tracker.start_scan:
                 id: ggs_ble_tracker
                 continuous: false
+  # Push last parsed device state to HA (template entities use update_interval: never).
+  - interval: 5s
+    then:
+      - lambda: |-
+          if (id(sf_fan_level) >= 0) {
+            id(sf_fan_level_text).publish_state(to_string(id(sf_fan_level)));
+          }
+          if (id(sf_fan_on) >= 0) {
+            id(sf_fan_bin).publish_state(id(sf_fan_on) == 1);
+          }
+          if (id(sf_light_level) >= 0) {
+            id(sf_light_level_text).publish_state(to_string(id(sf_light_level)) + "%");
+          }
+          if (id(sf_light_on) >= 0) {
+            id(sf_light_bin).publish_state(id(sf_light_on) == 1);
+          }
+          if (id(sf_light2_level) >= 0) {
+            id(sf_light2_level_text).publish_state(to_string(id(sf_light2_level)) + "%");
+          }
+          if (id(sf_blower_level) >= 0) {
+            id(sf_blower_level_text).publish_state(to_string(id(sf_blower_level)) + "%");
+          }
+          if (id(sf_blower_on) >= 0) {
+            id(sf_blower_bin).publish_state(id(sf_blower_on) == 1);
+          }
+          if (id(sf_humidifier_level) >= 0) {
+            id(sf_humidifier_level_text).publish_state(to_string(id(sf_humidifier_level)));
+          }
+          if (id(sf_humidifier_on) >= 0) {
+            id(sf_humidifier_bin).publish_state(id(sf_humidifier_on) == 1);
+          }
   # Status pull while HA is connected (ensures initial publish and periodic refresh).
   - interval: ${ggs_status_interval}
     then:
@@ -205,6 +236,11 @@ sensor:
       }
       if (chunk.empty()) return 0.0f;
 
+      // Each getDevSta notify starts a new JSON stream — do not concatenate cycles.
+      if (chunk.find("getDevSta") != std::string::npos) {
+        id(rx_buffer).clear();
+      }
+
       // Capture previous values so we can publish-on-change.
       const float prev_temp = id(sf_temp);
       const float prev_humi = id(sf_humi);
@@ -226,8 +262,9 @@ sensor:
       if (json_start != std::string::npos && json_start > 0) {
         id(rx_buffer).erase(0, json_start);
       }
-      if (id(rx_buffer).size() > 2048) {
-        id(rx_buffer).erase(0, id(rx_buffer).size() - 2048);
+      // Do not trim mid-frame (was dropping packet-1 sensor data before packet-2 arrived).
+      if (id(rx_buffer).size() > 4096) {
+        id(rx_buffer).clear();
       }
 
       // Extract a full {...} object after a JSON key (do not use the first '}' in the string).
@@ -322,20 +359,91 @@ sensor:
         }
       };
 
-      // Primary light block is in BLE packet 1 (before light2). "on" is often 1 while level is 0
-      // during dark cycle — level is the real output state.
+      // Primary light: before light2. NOTIFY often splits "level" -> "l"+junk+"evel":N (see tools/ggs_ble.py capture).
       auto apply_light_from = [&](const std::string &hay) {
-        size_t key = hay.find("\"light\":");
-        if (key == std::string::npos) {
-          key = hay.find("light\":");
-          if (key == std::string::npos) return;
-        }
-        size_t slice_end = hay.size();
-        auto l2 = hay.find("\"light2\"", key + 6);
-        if (l2 != std::string::npos && l2 < slice_end) slice_end = l2;
-        if (slice_end - key > 160) slice_end = key + 160;
-        std::string slice = hay.substr(key, slice_end - key);
+        auto l2k = hay.find("light2");
+        if (l2k == std::string::npos) return;
 
+        size_t lk = hay.rfind("\"light\":", l2k);
+        if (lk == std::string::npos) {
+          lk = hay.rfind("light\":", l2k);
+          if (lk != std::string::npos && lk > 0 && hay[lk - 1] == 'w') lk--;
+        }
+        if (lk == std::string::npos || lk >= l2k) return;
+
+        auto read_pct = [&](size_t key_pos) -> int {
+          size_t pos = key_pos;
+          while (pos < l2k) {
+            auto el_pos = hay.find("el\":", pos);
+            if (el_pos == std::string::npos || el_pos >= l2k) break;
+            int v = atoi(hay.c_str() + el_pos + 4);
+            if (v >= 0 && v <= 100) return v;
+            pos = el_pos + 4;
+          }
+          return -1;
+        };
+
+        int lvl = read_pct(lk);
+        if (lvl < 0 || lvl > 100) return;
+        id(sf_light_level) = lvl;
+        id(sf_light_on) = lvl > 0 ? 1 : 0;
+      };
+
+      // Packet 1: sensor + light (no fan/}}). Packet 2: blower + fan + humidifier. Parse each as it arrives.
+      auto apply_sensor_from = [&](const std::string &hay) {
+        auto pos = hay.find("sensor");
+        if (pos == std::string::npos) return;
+        size_t end = hay.find("\"light\":", pos);
+        if (end == std::string::npos) end = hay.find("light\":", pos);
+        if (end == std::string::npos) end = pos + 180;
+        std::string slice = hay.substr(pos, end - pos);
+        auto ex = [&](const char *key, float &target) {
+          auto p = slice.find(key);
+          if (p == std::string::npos) return;
+          p = slice.find(':', p);
+          if (p == std::string::npos) return;
+          p++;
+          char *p_end = nullptr;
+          float v = strtof(slice.c_str() + p, &p_end);
+          if (p_end != slice.c_str() + p) target = v;
+        };
+        ex("\"temp\"", id(sf_temp));
+        ex("\"humi\"", id(sf_humi));
+        ex("\"vpd\"", id(sf_vpd));
+      };
+
+      // Fan level: "level" after "fan" (packet 2), before humidifier. Substring "fan" like blower.
+      auto apply_fan_from = [&](const std::string &hay) {
+        auto bp = hay.find("blower");
+        size_t start = bp == std::string::npos ? 0 : bp;
+        auto fp = hay.find("fan", start);
+        if (fp == std::string::npos) return;
+        auto hp = hay.find("humidifier", fp);
+        size_t end = hp == std::string::npos ? fp + 120 : hp;
+        auto lvl_pos = hay.find("\"level\"", fp);
+        if (lvl_pos == std::string::npos || lvl_pos >= end) return;
+        auto colon = hay.find(':', lvl_pos);
+        if (colon == std::string::npos) return;
+        int lvl = atoi(hay.c_str() + colon + 1);
+        if (lvl < 0 || lvl > 10) return;
+        id(sf_fan_level) = lvl;
+        id(sf_fan_on) = lvl > 0 ? 1 : 0;
+        auto on_pos = hay.find("\"on\"", fp);
+        if (on_pos != std::string::npos && on_pos < end) {
+          auto on_colon = hay.find(':', on_pos);
+          if (on_colon != std::string::npos) {
+            int on = atoi(hay.c_str() + on_colon + 1);
+            if (on == 0 || on == 1) id(sf_fan_on) = on;
+          }
+        }
+      };
+
+      auto apply_humidifier_from = [&](const std::string &hay) {
+        auto pos = hay.find("humidifier");
+        if (pos == std::string::npos) return;
+        size_t end = hay.size();
+        if (end - pos > 120) end = pos + 120;
+        std::string slice = hay.substr(pos, end - pos);
         auto field_int = [&](const char *field) -> int {
           std::string fk = std::string("\"") + field + "\":";
           auto fp = slice.find(fk);
@@ -344,23 +452,49 @@ sensor:
           if (colon == std::string::npos) return -1;
           return atoi(slice.c_str() + colon + 1);
         };
-
         int lvl = field_int("level");
-        auto ldot = slice.find("\"l.evel\"");
-        if (ldot != std::string::npos) {
-          auto colon = slice.find(':', ldot);
-          if (colon != std::string::npos) {
-            int v = atoi(slice.c_str() + colon + 1);
-            if (v >= 0 && v <= 100) lvl = v;
-          }
+        if (lvl >= 0 && lvl <= 100) {
+          id(sf_humidifier_level) = lvl;
+          id(sf_humidifier_on) = lvl > 0 ? 1 : 0;
         }
-        if (lvl < 0 || lvl > 100) return;
-        id(sf_light_level) = lvl;
-        id(sf_light_on) = lvl > 0 ? 1 : 0;
       };
 
-      // Opportunistic blower parse on every fragment (blower often arrives without a full frame).
-      apply_blower_from(id(rx_buffer));
+      auto apply_light2_from = [&](const std::string &hay) {
+        auto pos = hay.find("light2");
+        if (pos == std::string::npos) return;
+        size_t end = hay.find("blower", pos);
+        if (end == std::string::npos) end = pos + 80;
+        std::string slice = hay.substr(pos, end - pos);
+        auto lvl_pos = slice.find("\"level\"");
+        if (lvl_pos == std::string::npos) return;
+        auto colon = slice.find(':', lvl_pos);
+        if (colon == std::string::npos) return;
+        int v = atoi(slice.c_str() + colon + 1);
+        if (v >= 0 && v <= 100) id(sf_light2_level) = v;
+      };
+
+      auto run_device_parsers = [&](const std::string &hay) {
+        apply_sensor_from(hay);
+        apply_light_from(hay);
+        apply_light2_from(hay);
+        apply_fan_from(hay);
+        apply_blower_from(hay);
+        apply_humidifier_from(hay);
+      };
+
+      const std::string &parse_hay = id(rx_buffer);
+      const bool buf_has_sensor = parse_hay.find("sensor") != std::string::npos;
+      const bool buf_has_fan = parse_hay.find("fan") != std::string::npos;
+      const bool buf_complete = buf_has_sensor && buf_has_fan && parse_hay.find("}}") != std::string::npos;
+
+      run_device_parsers(parse_hay);
+
+      ESP_LOGI("ggs", "parse len=%u sensor=%d fan=%d lkey=%d l2=%d light=%d fan_lvl=%d",
+               (unsigned) parse_hay.size(), buf_has_sensor, buf_has_fan,
+               (int) (parse_hay.find("\"light\":") != std::string::npos ||
+                      parse_hay.find("light\":") != std::string::npos),
+               (int) (parse_hay.find("light2") != std::string::npos),
+               id(sf_light_level), id(sf_fan_level));
 
       const bool force = !id(sf_published_once);
       auto publish_float = [&](float prev, float cur, sensor::Sensor *s) {
@@ -378,114 +512,27 @@ sensor:
         s->publish_state(cur == 1);
       };
 
-      // Full-frame parse (reference bridge: fan present + closing braces).
-      const bool has_fan = id(rx_buffer).find("\"fan\"") != std::string::npos;
-      const bool has_frame_end = id(rx_buffer).find("}}") != std::string::npos;
-      if (!has_fan || !has_frame_end) {
+      auto publish_all = [&]() {
+        publish_float(prev_temp, id(sf_temp), id(sf_temp_sensor));
+        publish_float(prev_humi, id(sf_humi), id(sf_humi_sensor));
+        publish_float(prev_vpd, id(sf_vpd), id(sf_vpd_sensor));
+        publish_text_int(prev_fan_level, id(sf_fan_level), id(sf_fan_level_text), false);
+        publish_text_int(prev_light_level, id(sf_light_level), id(sf_light_level_text), true);
+        publish_text_int(prev_light2_level, id(sf_light2_level), id(sf_light2_level_text), true);
         publish_text_int(prev_blower_level, id(sf_blower_level), id(sf_blower_level_text), true);
+        publish_text_int(prev_humidifier_level, id(sf_humidifier_level), id(sf_humidifier_level_text), false);
+        publish_bin(prev_fan_on, id(sf_fan_on), id(sf_fan_bin));
+        publish_bin(prev_light_on, id(sf_light_on), id(sf_light_bin));
         publish_bin(prev_blower_on, id(sf_blower_on), id(sf_blower_bin));
-        if (id(sf_blower_level) >= 0 || id(sf_blower_on) >= 0) id(sf_published_once) = true;
-        return 0.0f;
-      }
-
-      auto start = id(rx_buffer).find('{');
-      if (start == std::string::npos) return 0.0f;
-      auto end = id(rx_buffer).rfind('}');
-      if (end == std::string::npos || end < start) return 0.0f;
-      std::string devices_hay = id(rx_buffer).substr(start, end - start + 1);
-      id(rx_buffer).clear();
-
-      apply_blower_from(devices_hay);
-
-      auto extract_float = [&](const std::string &hay, const char *key, float &target) {
-        auto pos = hay.find(key);
-        if (pos == std::string::npos) return;
-        pos = hay.find(':', pos);
-        if (pos == std::string::npos) return;
-        pos++;
-        while (pos < hay.size() && hay[pos] == ' ') pos++;
-        char *p_end = nullptr;
-        float v = strtof(hay.c_str() + pos, &p_end);
-        if (p_end != hay.c_str() + pos) target = v;
+        publish_bin(prev_humidifier_on, id(sf_humidifier_on), id(sf_humidifier_bin));
+        id(sf_published_once) = true;
       };
 
-      extract_float(devices_hay, "\"temp\"", id(sf_temp));
-      extract_float(devices_hay, "\"humi\"", id(sf_humi));
-      extract_float(devices_hay, "\"vpd\"", id(sf_vpd));
-      std::string fan_block = json_object_after_key(devices_hay, "\"fan\"");
-      if (!fan_block.empty()) {
-        auto level_pos = fan_block.find("\"level\"");
-        if (level_pos != std::string::npos) {
-          auto colon = fan_block.find(':', level_pos);
-          if (colon != std::string::npos) {
-            int v = atoi(fan_block.c_str() + colon + 1);
-            if (v >= 0 && v <= 10) id(sf_fan_level) = v;
-          }
-        }
-        auto on_pos = fan_block.find("\"on\"");
-        if (on_pos != std::string::npos) {
-          auto colon = fan_block.find(':', on_pos);
-          if (colon != std::string::npos) {
-            int v = atoi(fan_block.c_str() + colon + 1);
-            if (v == 0 || v == 1) id(sf_fan_on) = v;
-          }
-        }
+      publish_all();
+
+      if (buf_complete) {
+        id(rx_buffer).clear();
       }
-
-      // Require light2 marker — proves packet-1 device block is complete (avoids 0/85 flicker).
-      if (devices_hay.find("\"light2\"") != std::string::npos) {
-        apply_light_from(devices_hay);
-      }
-
-      auto light2_pos = devices_hay.find("\"light2\"");
-      if (light2_pos != std::string::npos) {
-        std::string light2_block = json_object_after_key(devices_hay, "\"light2\"");
-        if (light2_block.empty()) light2_block = devices_hay.substr(light2_pos);
-        auto level_pos = light2_block.find("\"level\"");
-        if (level_pos != std::string::npos) {
-          auto colon = light2_block.find(':', level_pos);
-          if (colon != std::string::npos) {
-            int v = atoi(light2_block.c_str() + colon + 1);
-            if (v >= 0 && v <= 100) id(sf_light2_level) = v;
-          }
-        }
-      }
-
-      auto humidifier_pos = devices_hay.find("\"humidifier\"");
-      if (humidifier_pos != std::string::npos) {
-        std::string humidifier_block = json_object_after_key(devices_hay, "\"humidifier\"");
-        if (humidifier_block.empty()) humidifier_block = devices_hay.substr(humidifier_pos);
-        auto level_pos = humidifier_block.find("\"level\"");
-        if (level_pos != std::string::npos) {
-          auto colon = humidifier_block.find(':', level_pos);
-          if (colon != std::string::npos) {
-            id(sf_humidifier_level) = atoi(humidifier_block.c_str() + colon + 1);
-            id(sf_humidifier_on) = id(sf_humidifier_level) > 0 ? 1 : 0;
-          }
-        }
-        auto on_pos = humidifier_block.find("\"on\"");
-        if (on_pos != std::string::npos) {
-          auto colon = humidifier_block.find(':', on_pos);
-          if (colon != std::string::npos) id(sf_humidifier_on) = atoi(humidifier_block.c_str() + colon + 1);
-        }
-      }
-
-      publish_float(prev_temp, id(sf_temp), id(sf_temp_sensor));
-      publish_float(prev_humi, id(sf_humi), id(sf_humi_sensor));
-      publish_float(prev_vpd, id(sf_vpd), id(sf_vpd_sensor));
-
-      publish_text_int(prev_fan_level, id(sf_fan_level), id(sf_fan_level_text), false);
-      publish_text_int(prev_light_level, id(sf_light_level), id(sf_light_level_text), true);
-      publish_text_int(prev_light2_level, id(sf_light2_level), id(sf_light2_level_text), true);
-      publish_text_int(prev_blower_level, id(sf_blower_level), id(sf_blower_level_text), true);
-      publish_text_int(prev_humidifier_level, id(sf_humidifier_level), id(sf_humidifier_level_text), false);
-
-      publish_bin(prev_fan_on, id(sf_fan_on), id(sf_fan_bin));
-      publish_bin(prev_light_on, id(sf_light_on), id(sf_light_bin));
-      publish_bin(prev_blower_on, id(sf_blower_on), id(sf_blower_bin));
-      publish_bin(prev_humidifier_on, id(sf_humidifier_on), id(sf_humidifier_bin));
-
-      id(sf_published_once) = true;
       return 0.0f;
 
   - platform: template
@@ -616,6 +663,10 @@ text_sensor:
         return {};
       }
       return to_string(id(sf_humidifier_level));
+
+switch:
+  - platform: restart
+    name: "Reboot" 
 
 # Optional MQTT export.
 # Uncomment and set secrets if you still want MQTT beside Home Assistant native API.

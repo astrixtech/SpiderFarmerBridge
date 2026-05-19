@@ -489,13 +489,6 @@ sensor:
 
       run_device_parsers(parse_hay);
 
-      ESP_LOGI("ggs", "parse len=%u sensor=%d fan=%d lkey=%d l2=%d light=%d fan_lvl=%d",
-               (unsigned) parse_hay.size(), buf_has_sensor, buf_has_fan,
-               (int) (parse_hay.find("\"light\":") != std::string::npos ||
-                      parse_hay.find("light\":") != std::string::npos),
-               (int) (parse_hay.find("light2") != std::string::npos),
-               id(sf_light_level), id(sf_fan_level));
-
       const bool force = !id(sf_published_once);
       auto publish_float = [&](float prev, float cur, sensor::Sensor *s) {
         if (force || cur != prev) s->publish_state(cur);

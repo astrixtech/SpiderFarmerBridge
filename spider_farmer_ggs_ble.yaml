@@ -31,7 +31,7 @@ esphome:
   min_version: 2024.6.0
   project:
     name: local.spider_farmer_ggs_ble
-    version: "0.4.6"
+    version: "0.4.7"
 
 # `variant` (+ `flash_size`) is enough to build. Add `board: <id>` only if you need a devkit’s pin map.
 esp32:
@@ -359,7 +359,7 @@ sensor:
         }
       };
 
-      // Primary light: before light2. NOTIFY often splits "level" -> "l"+junk+"evel":N (see tools/ggs_ble.py capture).
+      // Primary light: before light2. NOTIFY splits "level" -> "l"+junk+"evel":N; only trust on full frame.
       auto apply_light_from = [&](const std::string &hay) {
         auto l2k = hay.find("light2");
         if (l2k == std::string::npos) return;
@@ -371,19 +371,31 @@ sensor:
         }
         if (lk == std::string::npos || lk >= l2k) return;
 
-        auto read_pct = [&](size_t key_pos) -> int {
-          size_t pos = key_pos;
-          while (pos < l2k) {
-            auto el_pos = hay.find("el\":", pos);
-            if (el_pos == std::string::npos || el_pos >= l2k) break;
-            int v = atoi(hay.c_str() + el_pos + 4);
-            if (v >= 0 && v <= 100) return v;
-            pos = el_pos + 4;
-          }
+        std::string region = hay.substr(lk, l2k - lk);
+        auto read_field = [&](const char *key) -> int {
+          auto p = region.find(key);
+          if (p == std::string::npos) return -1;
+          int v = atoi(region.c_str() + p + strlen(key));
+          if (v >= 0 && v <= 100) return v;
           return -1;
         };
 
-        int lvl = read_pct(lk);
+        int lvl = read_field("\"level\":");
+        if (lvl < 0) lvl = read_field("evel\":");
+        if (lvl < 0) {
+          // Split/corrupt key (e.g. "levg%el":85): last el": preceded by v, l, or %
+          size_t pos = 0;
+          while (pos < region.size()) {
+            auto el_pos = region.find("el\":", pos);
+            if (el_pos == std::string::npos) break;
+            char before = el_pos > 0 ? region[el_pos - 1] : '\0';
+            if (before == 'v' || before == 'l' || before == '%') {
+              int v = atoi(region.c_str() + el_pos + 4);
+              if (v >= 0 && v <= 100) lvl = v;
+            }
+            pos = el_pos + 4;
+          }
+        }
         if (lvl < 0 || lvl > 100) return;
         id(sf_light_level) = lvl;
         id(sf_light_on) = lvl > 0 ? 1 : 0;
@@ -473,13 +485,15 @@ sensor:
         if (v >= 0 && v <= 100) id(sf_light2_level) = v;
       };
 
-      auto run_device_parsers = [&](const std::string &hay) {
+      auto run_device_parsers = [&](const std::string &hay, bool complete) {
         apply_sensor_from(hay);
-        apply_light_from(hay);
-        apply_light2_from(hay);
-        apply_fan_from(hay);
-        apply_blower_from(hay);
-        apply_humidifier_from(hay);
+        if (complete) {
+          apply_light_from(hay);
+          apply_light2_from(hay);
+          apply_fan_from(hay);
+          apply_blower_from(hay);
+          apply_humidifier_from(hay);
+        }
       };
 
       const std::string &parse_hay = id(rx_buffer);
@@ -487,7 +501,7 @@ sensor:
       const bool buf_has_fan = parse_hay.find("fan") != std::string::npos;
       const bool buf_complete = buf_has_sensor && buf_has_fan && parse_hay.find("}}") != std::string::npos;
 
-      run_device_parsers(parse_hay);
+      run_device_parsers(parse_hay, buf_complete);
 
       const bool force = !id(sf_published_once);
       auto publish_float = [&](float prev, float cur, sensor::Sensor *s) {
@@ -505,23 +519,25 @@ sensor:
         s->publish_state(cur == 1);
       };
 
-      auto publish_all = [&]() {
+      auto publish_all = [&](bool include_devices) {
         publish_float(prev_temp, id(sf_temp), id(sf_temp_sensor));
         publish_float(prev_humi, id(sf_humi), id(sf_humi_sensor));
         publish_float(prev_vpd, id(sf_vpd), id(sf_vpd_sensor));
-        publish_text_int(prev_fan_level, id(sf_fan_level), id(sf_fan_level_text), false);
-        publish_text_int(prev_light_level, id(sf_light_level), id(sf_light_level_text), true);
-        publish_text_int(prev_light2_level, id(sf_light2_level), id(sf_light2_level_text), true);
-        publish_text_int(prev_blower_level, id(sf_blower_level), id(sf_blower_level_text), true);
-        publish_text_int(prev_humidifier_level, id(sf_humidifier_level), id(sf_humidifier_level_text), false);
-        publish_bin(prev_fan_on, id(sf_fan_on), id(sf_fan_bin));
-        publish_bin(prev_light_on, id(sf_light_on), id(sf_light_bin));
-        publish_bin(prev_blower_on, id(sf_blower_on), id(sf_blower_bin));
-        publish_bin(prev_humidifier_on, id(sf_humidifier_on), id(sf_humidifier_bin));
+        if (include_devices) {
+          publish_text_int(prev_fan_level, id(sf_fan_level), id(sf_fan_level_text), false);
+          publish_text_int(prev_light_level, id(sf_light_level), id(sf_light_level_text), true);
+          publish_text_int(prev_light2_level, id(sf_light2_level), id(sf_light2_level_text), true);
+          publish_text_int(prev_blower_level, id(sf_blower_level), id(sf_blower_level_text), true);
+          publish_text_int(prev_humidifier_level, id(sf_humidifier_level), id(sf_humidifier_level_text), false);
+          publish_bin(prev_fan_on, id(sf_fan_on), id(sf_fan_bin));
+          publish_bin(prev_light_on, id(sf_light_on), id(sf_light_bin));
+          publish_bin(prev_blower_on, id(sf_blower_on), id(sf_blower_bin));
+          publish_bin(prev_humidifier_on, id(sf_humidifier_on), id(sf_humidifier_bin));
+        }
         id(sf_published_once) = true;
       };
 
-      publish_all();
+      publish_all(buf_complete);
 
       if (buf_complete) {
         id(rx_buffer).clear();

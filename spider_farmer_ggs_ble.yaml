@@ -29,9 +29,14 @@ esphome:
   name: ${device_name}
   friendly_name: ${friendly_name}
   min_version: 2024.6.0
+  on_boot:
+    # ble_client switch may restore OFF from prefs; ensure GGS link is enabled after reboot.
+    - priority: -10
+      then:
+        - switch.turn_on: ggs_connect_switch
   project:
     name: local.spider_farmer_ggs_ble
-    version: "0.4.7"
+    version: "0.5.1"
 
 # `variant` (+ `flash_size`) is enough to build. Add `board: <id>` only if you need a devkit’s pin map.
 esp32:
@@ -111,7 +116,9 @@ interval:
     then:
       - if:
           condition:
-            lambda: 'return !id(ggs_client).connected();'
+            and:
+              - switch.is_on: ggs_connect_switch
+              - lambda: 'return !id(ggs_client).connected();'
           then:
             - esp32_ble_tracker.start_scan:
                 id: ggs_ble_tracker
@@ -126,12 +133,7 @@ interval:
           if (id(sf_fan_on) >= 0) {
             id(sf_fan_bin).publish_state(id(sf_fan_on) == 1);
           }
-          if (id(sf_light_level) >= 0) {
-            id(sf_light_level_text).publish_state(to_string(id(sf_light_level)) + "%");
-          }
-          if (id(sf_light_on) >= 0) {
-            id(sf_light_bin).publish_state(id(sf_light_on) == 1);
-          }
+          // Light: only publish on NOTIFY path (avoids re-firing HA logbook every 5s).
           if (id(sf_light2_level) >= 0) {
             id(sf_light2_level_text).publish_state(to_string(id(sf_light2_level)) + "%");
           }
@@ -153,6 +155,7 @@ interval:
       - if:
           condition:
             and:
+              - switch.is_on: ggs_connect_switch
               - lambda: 'return id(ggs_client).connected();'
               - api.connected:
                   state_subscription_only: true
@@ -213,6 +216,11 @@ globals:
     restore_value: no
     initial_value: "-1"
   - id: sf_humidifier_on
+    type: int
+    restore_value: no
+    initial_value: "-1"
+  # 0 = dark schedule (force light 0). 1 = day/ramp (use parsed level).
+  - id: sf_is_day_env_target
     type: int
     restore_value: no
     initial_value: "-1"
@@ -359,7 +367,7 @@ sensor:
         }
       };
 
-      // Primary light: before light2. NOTIFY splits "level" -> "l"+junk+"evel":N; only trust on full frame.
+      // Primary light: NOTIFY splits "level":0 -> "level":7!0} — digit before ! is garbage; !0} means 0.
       auto apply_light_from = [&](const std::string &hay) {
         auto l2k = hay.find("light2");
         if (l2k == std::string::npos) return;
@@ -372,31 +380,56 @@ sensor:
         if (lk == std::string::npos || lk >= l2k) return;
 
         std::string region = hay.substr(lk, l2k - lk);
-        auto read_field = [&](const char *key) -> int {
-          auto p = region.find(key);
-          if (p == std::string::npos) return -1;
-          int v = atoi(region.c_str() + p + strlen(key));
+        auto int_after_colon = [&](const char *start) -> int {
+          if (start == nullptr) return -1;
+          while (*start == ' ' || *start == '\t') start++;
+          while (*start != '\0' && (*start < '0' || *start > '9')) start++;
+          if (*start == '\0') return -1;
+          int v = atoi(start);
           if (v >= 0 && v <= 100) return v;
           return -1;
         };
 
-        int lvl = read_field("\"level\":");
-        if (lvl < 0) lvl = read_field("evel\":");
-        if (lvl < 0) {
-          // Split/corrupt key (e.g. "levg%el":85): last el": preceded by v, l, or %
+        int lvl = -1;
+        // Dark-period split tail (capture: "level":7!0} is 0%, not 7%).
+        if (region.find("!0}") != std::string::npos) {
+          lvl = 0;
+        } else {
           size_t pos = 0;
           while (pos < region.size()) {
-            auto el_pos = region.find("el\":", pos);
-            if (el_pos == std::string::npos) break;
-            char before = el_pos > 0 ? region[el_pos - 1] : '\0';
-            if (before == 'v' || before == 'l' || before == '%') {
-              int v = atoi(region.c_str() + el_pos + 4);
-              if (v >= 0 && v <= 100) lvl = v;
+            auto p = region.find("evel\":", pos);
+            if (p == std::string::npos) break;
+            int v = int_after_colon(region.c_str() + p + 6);
+            if (v >= 0) lvl = v;
+            pos = p + 6;
+          }
+          if (lvl < 0) {
+            auto lp = region.find("level\":");
+            if (lp != std::string::npos) {
+              size_t bang = region.find('!', lp);
+              if (bang == std::string::npos || bang > lp + 32) {
+                int v = int_after_colon(region.c_str() + lp + 8);
+                if (v >= 0) lvl = v;
+              }
             }
-            pos = el_pos + 4;
+          }
+          if (lvl < 0) {
+            pos = 0;
+            while (pos < region.size()) {
+              auto el_pos = region.find("el\":", pos);
+              if (el_pos == std::string::npos) break;
+              char before = el_pos > 0 ? region[el_pos - 1] : '\0';
+              if (before == 'v' || before == 'l' || before == '%' || before == '(') {
+                int v = int_after_colon(region.c_str() + el_pos + 4);
+                if (v >= 0 && v <= 100) lvl = v;
+              }
+              pos = el_pos + 4;
+            }
           }
         }
+
         if (lvl < 0 || lvl > 100) return;
+        if (id(sf_is_day_env_target) == 0) lvl = 0;
         id(sf_light_level) = lvl;
         id(sf_light_on) = lvl > 0 ? 1 : 0;
       };
@@ -422,6 +455,15 @@ sensor:
         ex("\"temp\"", id(sf_temp));
         ex("\"humi\"", id(sf_humi));
         ex("\"vpd\"", id(sf_vpd));
+        auto ex_int = [&](const char *key, int &target) {
+          auto p = slice.find(key);
+          if (p == std::string::npos) return;
+          p = slice.find(':', p);
+          if (p == std::string::npos) return;
+          int v = atoi(slice.c_str() + p + 1);
+          if (v == 0 || v == 1) target = v;
+        };
+        ex_int("\"isDayEnvTarget\"", id(sf_is_day_env_target));
       };
 
       // Fan level: "level" after "fan" (packet 2), before humidifier. Substring "fan" like blower.
@@ -674,8 +716,15 @@ text_sensor:
       return to_string(id(sf_humidifier_level));
 
 switch:
+  # Turn OFF to release GGS BLE for PC capture (tools/ggs_ble.py). Turn ON to resume monitoring.
+  - platform: ble_client
+    ble_client_id: ggs_client
+    id: ggs_connect_switch
+    name: "GGS Connect"
+    icon: mdi:bluetooth-connect
+    restore_mode: ALWAYS_ON
   - platform: restart
-    name: "Reboot" 
+    name: "Reboot"
 
 # Optional MQTT export.
 # Uncomment and set secrets if you still want MQTT beside Home Assistant native API.
